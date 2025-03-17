@@ -5,6 +5,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
+use std::io::{self, Error};
+
+// Define SO_ORIGINAL_DST manually
+const SO_ORIGINAL_DST: libc::c_int = 80;
+use std::os::unix::io::AsRawFd;
+use std::mem::{self};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 type BoxedError = Box<dyn std::error::Error + Sync + Send + 'static>;
 static DEBUG: AtomicBool = AtomicBool::new(false);
@@ -48,18 +55,6 @@ async fn main() -> Result<(), BoxedError> {
             std::process::exit(-1);
         }
     };
-    let remote = match matches.free.len() {
-        1 => matches.free[0].clone(),
-        _ => {
-            print_usage(&program, opts);
-            std::process::exit(-1);
-        }
-    };
-
-    if !remote.contains(':') {
-        eprintln!("A remote port is required (REMOTE_ADDR:PORT)");
-        std::process::exit(-1);
-    }
 
     DEBUG.store(matches.opt_present("d"), Ordering::Relaxed);
     // let local_port: i32 = matches.opt_str("l").unwrap_or("0".to_string()).parse()?;
@@ -69,10 +64,64 @@ async fn main() -> Result<(), BoxedError> {
         None => "127.0.0.1".to_owned(),
     };
 
-    forward(&bind_addr, local_port, remote).await
+    forward(&bind_addr, local_port).await
 }
 
-async fn forward(bind_ip: &str, local_port: i32, remote: String) -> Result<(), BoxedError> {
+fn get_original_destination_addr(s: &TcpStream) -> io::Result<std::net::SocketAddr> {
+    let fd = s.as_raw_fd();
+
+    unsafe {
+        // Try for IPv6 first
+        let mut addr_v6: libc::sockaddr_in6 = mem::zeroed();
+        let mut addr_len = mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+
+        let ret = libc::getsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            SO_ORIGINAL_DST,
+            &mut addr_v6 as *mut _ as *mut libc::c_void,
+            &mut addr_len,
+        );
+
+        if ret == 0 {
+            let ip = Ipv6Addr::new(
+                ((addr_v6.sin6_addr.s6_addr[0] as u16) << 8) | addr_v6.sin6_addr.s6_addr[1] as u16,
+                ((addr_v6.sin6_addr.s6_addr[2] as u16) << 8) | addr_v6.sin6_addr.s6_addr[3] as u16,
+                ((addr_v6.sin6_addr.s6_addr[4] as u16) << 8) | addr_v6.sin6_addr.s6_addr[5] as u16,
+                ((addr_v6.sin6_addr.s6_addr[6] as u16) << 8) | addr_v6.sin6_addr.s6_addr[7] as u16,
+                ((addr_v6.sin6_addr.s6_addr[8] as u16) << 8) | addr_v6.sin6_addr.s6_addr[9] as u16,
+                ((addr_v6.sin6_addr.s6_addr[10] as u16) << 8) | addr_v6.sin6_addr.s6_addr[11] as u16,
+                ((addr_v6.sin6_addr.s6_addr[12] as u16) << 8) | addr_v6.sin6_addr.s6_addr[13] as u16,
+                ((addr_v6.sin6_addr.s6_addr[14] as u16) << 8) | addr_v6.sin6_addr.s6_addr[15] as u16,
+            );
+            let port = u16::from_be(addr_v6.sin6_port);
+
+            return Ok(SocketAddr::new(IpAddr::V6(ip), port));
+        }
+
+        // Fall back to IPv4
+        let mut addr_v4: libc::sockaddr_in = mem::zeroed();
+        addr_len = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+
+        let ret = libc::getsockopt(
+            fd,
+            0, // SOL_IP
+            SO_ORIGINAL_DST,
+            &mut addr_v4 as *mut _ as *mut libc::c_void,
+            &mut addr_len,
+        );
+
+        if ret != 0 {
+            return Err(Error::last_os_error());
+        }
+
+        let ip = Ipv4Addr::from(u32::from_be(addr_v4.sin_addr.s_addr));
+        let port = u16::from_be(addr_v4.sin_port);
+        Ok(SocketAddr::new(IpAddr::V4(ip), port))
+    }
+}
+
+async fn forward(bind_ip: &str, local_port: i32) -> Result<(), BoxedError> {
     // Listen on the specified IP and port
     let bind_addr = if !bind_ip.starts_with('[') && bind_ip.contains(':') {
         // Correctly format for IPv6 usage
@@ -85,14 +134,6 @@ async fn forward(bind_ip: &str, local_port: i32, remote: String) -> Result<(), B
         .expect("Failed to parse bind address");
     let listener = TcpListener::bind(&bind_sock).await?;
     println!("Listening on {}", listener.local_addr().unwrap());
-
-    // `remote` should be either the host name or ip address, with the port appended.
-    // It doesn't get tested/validated until we get our first connection, though!
-
-    // We leak `remote` instead of wrapping it in an Arc to share it with future tasks since
-    // `remote` is going to live for the lifetime of the server in all cases.
-    // (This reduces MESI/MOESI cache traffic between CPU cores.)
-    let remote: &str = Box::leak(remote.into_boxed_str());
 
     // Two instances of this function are spawned for each half of the connection: client-to-server,
     // server-to-client. We can't use tokio::io::copy() instead (no matter how convenient it might
@@ -147,8 +188,21 @@ async fn forward(bind_ip: &str, local_port: i32, remote: String) -> Result<(), B
         tokio::spawn(async move {
             println!("New connection from {}", client_addr);
 
+            // Given a client TcpStream
+            let remote_addr = match get_original_destination_addr(&client) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    eprintln!("Error getting original destination address: {}", e);
+                    // Handle error appropriately
+                    return;
+                }
+            };
+            if DEBUG.load(Ordering::Relaxed) {
+                println!("Original destination address: {}", remote_addr);
+            }
+
             // Establish connection to upstream for each incoming client connection
-            let mut remote = match TcpStream::connect(remote).await {
+            let mut remote = match TcpStream::connect(remote_addr).await {
                 Ok(result) => result,
                 Err(e) => {
                     eprintln!("Error establishing upstream connection: {e}");
@@ -170,15 +224,15 @@ async fn forward(bind_ip: &str, local_port: i32, remote: String) -> Result<(), B
                 Ok(count) => {
                     if DEBUG.load(Ordering::Relaxed) {
                         eprintln!(
-                            "Transferred {} bytes from proxy client {} to upstream server",
-                            count, client_addr
+                            "Transferred {} bytes from proxy client {} to upstream server {}",
+                            count, client_addr, remote_addr
                         );
                     }
                 }
                 Err(err) => {
                     eprintln!(
-                        "Error writing bytes from proxy client {} to upstream server",
-                        client_addr
+                        "Error writing bytes from proxy client {} to upstream server {}",
+                        client_addr, remote_addr
                     );
                     eprintln!("{}", err);
                 }
@@ -188,15 +242,15 @@ async fn forward(bind_ip: &str, local_port: i32, remote: String) -> Result<(), B
                 Ok(count) => {
                     if DEBUG.load(Ordering::Relaxed) {
                         eprintln!(
-                            "Transferred {} bytes from upstream server to proxy client {}",
-                            count, client_addr
+                            "Transferred {} bytes from upstream server {} to proxy client {}",
+                            count, remote_addr, client_addr
                         );
                     }
                 }
                 Err(err) => {
                     eprintln!(
-                        "Error writing from upstream server to proxy client {}!",
-                        client_addr
+                        "Error writing from upstream server {} to proxy client {}!",
+                        remote_addr, client_addr
                     );
                     eprintln!("{}", err);
                 }
