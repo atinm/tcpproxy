@@ -7,10 +7,10 @@ _a simple, cross-platform, multi-client TCP proxy_
 
 ## Usage
 
-`tcpproxy` is a command-line application. One instance of `tcpproxy` should be started for each remote endpoint you wish to proxy data to/from. All configuration is done via command-line arguments, in keeping with the spirit of this project.
+`tcpproxy` is a command-line application. This will proxy any remote address that hits the proxy. All configuration is done via command-line arguments, in keeping with the spirit of this project.
 
 ```
-tcpproxy REMOTE_HOST:PORT [-b BIND_ADDR] [-l LOCAL_PORT]
+tcpproxy [-b BIND_ADDR] [-l LOCAL_PORT]
 
 Options:
     -b, --bind BIND_ADDR
