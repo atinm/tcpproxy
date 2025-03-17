@@ -21,7 +21,7 @@ RUN apt-get update && \
     apt-transport-https \
     ca-certificates \
     sudo make cmake lldb liblldb-dev clang libclang-dev libssl-dev git \
-    wget curl gnupg lsb-release protobuf-compiler iptables
+    wget curl gnupg lsb-release iptables
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"

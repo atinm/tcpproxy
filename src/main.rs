@@ -15,13 +15,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 type BoxedError = Box<dyn std::error::Error + Sync + Send + 'static>;
 static DEBUG: AtomicBool = AtomicBool::new(false);
+static USE_IP_TRANSPARENT: AtomicBool = AtomicBool::new(false);
 const BUF_SIZE: usize = 1024;
 
 fn print_usage(program: &str, opts: Options) {
     let program_path = std::path::PathBuf::from(program);
     let program_name = program_path.file_stem().unwrap().to_string_lossy();
     let brief = format!(
-        "Usage: {} REMOTE_HOST:PORT [-b BIND_ADDR] [-l LOCAL_PORT]",
+        "Usage: {} REMOTE_HOST:PORT [-b BIND_ADDR] [-l LOCAL_PORT] [-t] [-d]",
         program_name
     );
     print!("{}", opts.usage(&brief));
@@ -46,6 +47,7 @@ async fn main() -> Result<(), BoxedError> {
         "LOCAL_PORT",
     );
     opts.optflag("d", "debug", "Enable debug mode");
+    opts.optflag("t", "transparent", "Use IP_TRANSPARENT mode instead of SO_ORIGINAL_DST");
 
     let matches = match opts.parse(&args[1..]) {
         Ok(opts) => opts,
@@ -57,6 +59,8 @@ async fn main() -> Result<(), BoxedError> {
     };
 
     DEBUG.store(matches.opt_present("d"), Ordering::Relaxed);
+    USE_IP_TRANSPARENT.store(matches.opt_present("t"), Ordering::Relaxed);
+
     // let local_port: i32 = matches.opt_str("l").unwrap_or("0".to_string()).parse()?;
     let local_port: i32 = matches.opt_str("l").map(|s| s.parse()).unwrap_or(Ok(0))?;
     let bind_addr = match matches.opt_str("b") {
@@ -68,6 +72,11 @@ async fn main() -> Result<(), BoxedError> {
 }
 
 fn get_original_destination_addr(s: &TcpStream) -> io::Result<std::net::SocketAddr> {
+    // If IP_TRANSPARENT mode is enabled, use socket's local address
+    if USE_IP_TRANSPARENT.load(Ordering::Relaxed) {
+        return s.local_addr();
+    }
+
     let fd = s.as_raw_fd();
 
     unsafe {
@@ -132,8 +141,38 @@ async fn forward(bind_ip: &str, local_port: i32) -> Result<(), BoxedError> {
     let bind_sock = bind_addr
         .parse::<std::net::SocketAddr>()
         .expect("Failed to parse bind address");
-    let listener = TcpListener::bind(&bind_sock).await?;
-    println!("Listening on {}", listener.local_addr().unwrap());
+
+    // For IP_TRANSPARENT mode, we need to set socket options before binding
+    let listener = if USE_IP_TRANSPARENT.load(Ordering::Relaxed) {
+        // Create a standard socket first
+        let std_listener = std::net::TcpListener::bind(&bind_sock)?;
+        let fd = std_listener.as_raw_fd();
+
+        // Set IP_TRANSPARENT socket option
+        unsafe {
+            const IP_TRANSPARENT: libc::c_int = 19;
+            let val: libc::c_int = 1;
+            if libc::setsockopt(
+                fd,
+                libc::SOL_IP,
+                IP_TRANSPARENT,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&val) as libc::socklen_t,
+            ) != 0 {
+                return Err(Box::new(std::io::Error::last_os_error()));
+            }
+        }
+
+        // Convert to tokio listener
+        let listener = TcpListener::from_std(std_listener)?;
+        println!("Listening on {} with IP_TRANSPARENT", listener.local_addr().unwrap());
+        listener
+    } else {
+        // Standard binding for normal proxy mode
+        let listener = TcpListener::bind(&bind_sock).await?;
+        println!("Listening on {}", listener.local_addr().unwrap());
+        listener
+    };
 
     // Two instances of this function are spawned for each half of the connection: client-to-server,
     // server-to-client. We can't use tokio::io::copy() instead (no matter how convenient it might
